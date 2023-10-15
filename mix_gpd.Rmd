@@ -1,0 +1,785 @@
+---
+title: "Mixture Model Quantile treatment effect"
+author: "Arnab Aich"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+packages = c("nimble","codetools","devtools","Rcpp","dplyr","ggmcmc","snow","pracma",
+             "ggplot2","parallel","doParallel","doSNOW","reshape2","mvtnorm",'tinytex', 'rmarkdown','tidyr')
+knitr::opts_chunk$set(dev = "png",
+                      dpi = 300,
+                      echo = FALSE
+                       # ,cache = TRUE
+                     )
+invisible(xfun::pkg_attach(packages))
+    # tinytex::install_tinytex()
+```
+
+```{r Generalized Pareto Distribution density function, include=FALSE}
+dgpd <- nimbleFunction(
+  run = function(x = double(0),u = double(0),
+                 sigma = double(0),xi = double(0),
+                 log = integer(0, default = 0))
+  {
+    returnType(double(0))
+    z = (x - u) / sigma
+  if(x < u) logProb = -Inf
+  else
+  {
+    if(xi!=0) logProb = -(1 + (1 / xi)) * log(1 + (xi * z)) -log(sigma)
+    else logProb = -z - log(sigma)
+   }
+     if(log) return(logProb)
+    else return(exp(logProb))
+  }
+
+
+)
+compileNimble(dgpd)
+assign('dgpd', dgpd, .GlobalEnv)
+```
+
+```{r Generalized Pareto Distribution generating Function, warning=FALSE, include=FALSE}
+rgpd <- nimbleFunction(
+  run=function(n = integer(0),u=double(0)
+               ,sigma=double(0),xi=double(0))
+  {
+    if(n != 1) print("rgpdonly allows n = 1;")
+    else{
+      if(xi!=0) x = u + (sigma/xi)*((runif(1)^(-xi))-1)
+      else x = u - sigma*log(runif(1))
+    }
+    return(x)
+    returnType(double(0))
+  })
+compileNimble(rgpd)
+assign('rgpd', rgpd, .GlobalEnv)
+```
+
+
+```{r Cumulative sum, include=FALSE}
+cum_sum=nimbleFunction(run=function(p=double(1))
+{
+  returnType(double(1))
+  if(length(p)!=1)
+  {
+    for(j in 2:length(p))
+    p[j]=p[j-1]+p[j]
+    return(p)
+  }
+  else
+    return(p)
+})
+compileNimble(cum_sum)
+assign('cum_sum',cum_sum,.GlobalEnv)
+```
+
+```{r Total Density Function, include=FALSE}
+dTotal<- nimbleFunction(
+  run = function(x=double(0),weights = double(1),mu=double(1)
+                 ,eta=double(1),u=double(0),sigma=double(0)
+                 ,xi=double(0),log = integer(0, default = 0)) 
+  {
+    returnType(double(0))
+    if(x<u)
+     prob=sum(dnorm(x, mean = mu, sd = eta)*weights)
+    else
+    {
+      P=sum(pnorm(u, mean = mu, sd = eta)*weights)
+      prob=(1-P)*dgpd(x,u,sigma,xi)
+    }
+    if(!log) return(prob)
+    else return(log(prob))
+  })
+compileNimble(dTotal) 
+assign('dTotal', dTotal, .GlobalEnv)
+```
+
+```{r Total Generating Function, include=FALSE}
+#Generating Function 
+rTotal <- nimbleFunction(run=function(n = integer(0)
+                                      ,weights = double(1),mu=double(1)
+                                      ,eta=double(1),u=double(0)
+                                      ,sigma=double(0),xi=double(0))
+{
+  returnType(double(0))
+  if(n != 1) print("rTotal only allows n = 1;")
+  else{
+    P = sum(pnorm(u,mean = mu,sd = eta)*weights)
+    y = runif(1)
+    W = cum_sum(weights)
+    if(y<P)
+    {
+      index = min(which(W>runif(1)))
+      x = rnorm(1, mean = mu[index],sd = eta[index]) 
+    }
+    else
+    {
+      a = (1-y)/(1-P)
+      x = u+((sigma/xi)*(a^(-xi)-1))
+    }
+    
+    return(x)
+    
+  }
+  
+})   
+compileNimble(rTotal)
+assign('rTotal', rTotal, .GlobalEnv)
+```
+
+```{r Data Generation, warning=FALSE, include=FALSE}
+data_sim <- function(r,N,beta,wt1,wt0,theta0,theta1,eta0,gamma0,gamma1,eta1,delta0,delta1,sigma,xi)
+{
+  out = list()
+  # Generating Covariates
+  X = matrix(NA,N,4)
+  X[,1:4]<-matrix(runif(N*4,-2,4),nrow=N)
+  out$X = X 
+  ps=expit(X%*%beta)
+  out$PS = ps
+  mu0 = cbind(gamma0[1] + gamma1[1]*ps,gamma0[2] + gamma1[2]*ps)
+  mu1 = cbind(theta0[1] + theta1[1]*ps,theta0[2] + theta1[2]*ps)
+  out$mu = t(data.frame(mu0 = colMeans(mu0),mu1 = colMeans(mu1)))
+  u0 = delta0[1] + delta0[2]*ps
+  u1 = delta1[1] + delta1[2]*ps
+  out$u = c(u0 = mean(u0),u1 = mean(u1))
+  # Generating Response  
+  out$Y = data.frame(matrix(ncol=r,nrow=N))
+  out$T = data.frame(matrix(ncol=r,nrow=N))
+  print = sample.int(r,size = 1)
+  n_rep=1
+  repeat{
+    # treatment assignment
+      t <-rbinom(N,1,ps) 
+      out$T[,n_rep]<- t
+    # potential outcomes  
+    p0 = wt0*pnorm(u0,mu0[,1],eta0[1])+(1-wt0)*pnorm(u0,mu0[,2],eta0[2])
+    p1 = wt1*pnorm(u1,mu1[,1],eta1[1])+(1-wt1)*pnorm(u1,mu1[,2],eta1[2])
+    ### y(0)
+       y01 = ifelse(runif(N)<wt0,rnorm(N,mu0[,1],eta0[1]),rnorm(N,mu0[,2],eta0[2]))
+       y02 = u0+((sigma[1]/xi[1])*(runif(N)**(-xi[1])-1)) 
+       y0 = ifelse(runif(N)<p0,y01,y02)
+    ### y(1)
+       y11 = ifelse(runif(N)<wt1,rnorm(N,mu1[,1],eta1[1]),rnorm(N,mu1[,2],eta1[2]))
+       y12 = u1+((sigma[2]/xi[2])*(runif(N)**(-xi[2])-1))
+       y1 = ifelse(runif(N)<p1,y11,y12)
+    ### y
+      y =  ifelse(t==0,y0,y1)
+      out$Y[,n_rep] = y
+  # plots
+      if(n_rep == print)
+  {        
+    D1 = data.frame(Y0=y0,Y1=y1,Y=y)
+    out$Densities_wgpd = ggplot(data = D1) +
+                  geom_density(aes(x = Y0,color = "Control"),) +
+                  geom_density(aes(x = Y1,color = "Treatment"))+
+                  geom_density(aes(x = Y,color = "Observed"))+
+                  geom_vline(aes(xintercept = mean(u0),color = "Control"),linetype = "dashed")+
+                  geom_vline(aes(xintercept = mean(u1),color = "Treatment"),linetype = "dashed")+
+                  theme_classic()+xlab("Value")+ 
+                  ggtitle("Density Plots with Extreme Values")
+      ytilde=rep(NA,N)     
+      ytilde[t==1]<-y01[t==1]
+      ytilde[t==0]<-y11[t==0]
+    D2 = data.frame(Y0 = y01,Y1 = y11,Y = ytilde)
+    out$Densities_wogpd = ggplot(data = D2) +
+                  geom_density(aes(x = Y0,color = "Control"),) +
+                  geom_density(aes(x = Y1,color = "Treatment"))+
+                  geom_density(aes(x = Y,color = "Observed"))+
+                  theme_classic()+xlab("Value")+ 
+                  ggtitle("Density Plots without Extreme Values")
+  }
+    n_rep=n_rep+1
+    if(n_rep>r){break}
+  }
+  names(out$Y) <- NULL  
+  names(out$T) <- NULL  
+  y_long <- gather(data.frame(out$Y), key = "column", value = "value")
+
+  out$observed_densities = ggplot(data =  y_long, aes(x = value, group = column)) +
+                           geom_density(alpha = 0.5) +xlab("Value") +
+                            ylab("Density")+ ggtitle("Density Overlay Plot")+
+                            theme_classic()
+
+  return(out)
+}
+assign('data_sim',data_sim,.GlobalEnv)
+```
+
+```{r Generating data, eval=FALSE, comment=NA, include=FALSE}
+# 1st one for control 2nd one for treatment
+sigma_true = c(4,3)
+xi_true = c(0.2,0.3)
+
+eta1_true = c(0.4,0.4)
+eta0_true = c(0.5,0.5)
+# theta corresponds to Treatment group and Gamma to Control Group
+DATA=data_sim(r=5,N=200,beta= c(-0.03,-0.4,0.12,0.55),wt1=0.35,theta0=c(7,10),theta1=c(2.5,2),eta1 = eta1_true,wt0=0.5,gamma0=c(5.5,8),gamma1 = c(2,3),eta0 = eta0_true ,delta0=c(6.5,8),delta1 = c(7.5,9.5), sigma = sigma_true,xi= xi_true)
+mu_true=DATA$mu;mu_true
+u_true = DATA$u;u_true
+range(DATA$PS)
+mean(DATA$PS)
+DATA$Densities_wgpd
+DATA$Densities_wogpd
+DATA$observed_densities
+range(cbind(DATA$Y))
+length(which(is.na(DATA$Y)==TRUE))
+```
+```{r Density Function of True Distribution, include=FALSE}
+# function to generate true density
+dTrue <- function(x,weight,mu,eta,u,sigma,xi)
+{
+   if(x<u)
+    density <- sum(dnorm(x,mean = mu, sd = eta)*weight)
+  else 
+    density <- (1-sum(pnorm(u,mean = mu, sd = eta)*weight))*dgpd(x,u,sigma,xi)
+  return(density) 
+}
+assign("dTrue",dTrue,.GlobalEnv)
+```
+```{r Generating Function of True Distribution, include=FALSE}
+# function to generate sample from true density
+rTrue <- function(n,weight,mu,eta,u,sigma,xi)
+{
+  x = array()
+  prob <- sum(pnorm(u,mean = mu, sd = eta)*weight)
+  W = cum_sum(weight)
+  for( i in 1:n)
+  {
+    y = runif(1)
+    if(y<prob)
+    {
+      index = min(which(W>runif(1)))
+      x[i] = rnorm(1,mean = mu[index], sd = eta[index]) 
+    }
+     else
+    {
+      a = (1-y)/(1-prob)
+      x[i] = u+((sigma/xi)*(a^(-xi)-1)) 
+    }
+  }
+     return(x)
+}
+assign("rTrue",rTrue,.GlobalEnv)
+
+```
+```{r model Code for Treatment group, include=FALSE}
+code_trt=nimbleCode(
+  {
+    # concentration parameter
+          alpha ~ dgamma(1,1)
+   
+    # settign up stick breaking model
+      for(i in 1:(m-1))
+        {
+          v[i] ~ dbeta(1, alpha)
+        }
+  weights[1:m] <- stick_breaking(v[1:(m-1)])
+     for(j in 1:m)
+     {
+       eta[j] ~ dbeta(3,2)
+       theta0[j] ~ dnorm(mean = 8,sd  = 4)
+       theta1[j] ~ dnorm(mean = 2,sd  = 4)
+     }
+  # co effcient for u
+     delta0 ~ dnorm(mean = 5,sd  = 1)
+     delta1 ~ dnorm(mean = 5,sd  = 1)
+          
+  # additional Parameters for Tail Part
+            xi ~ T(dnorm(0.3, sd = 0.1),-0.5,Inf)
+          sigma ~ dgamma(shape = 2,scale = 2)
+  #  Distribution for data
+    for(i in 1:n)
+    {
+       # mixture model Regression
+      for(j in 1:m)
+      { 
+        mu[i,j] ~ dnorm(theta0[j]+theta1[j]*X[i], sd = 0.3)
+      }
+  #  GPD Regression
+           u[i] ~ dnorm(delta0 + delta1*X[i],sd = 1)
+           y[i] ~ dTotal(weights[1:m],mu[i,1:m],eta[1:m],u[i],sigma,xi)
+    }
+ })
+assign("code_trt",code_trt,.GlobalEnv)
+```
+```{r model Code for Control group, include=FALSE}
+code_con=nimbleCode(
+  {
+    # concentration parameter
+          alpha ~ dgamma(1,1)
+   
+    # settign up stick breaking model
+      for(i in 1:(m-1))
+        {
+          v[i] ~ dbeta(1, alpha)
+        }
+  weights[1:m] <- stick_breaking(v[1:(m-1)])
+     for(j in 1:m)
+     {
+       eta[j] ~ dbeta(5,1)
+       theta0[j] ~ dnorm(mean = 6,sd  = 5)
+       theta1[j] ~ dnorm(mean = 2,sd  = 5)
+     }
+  # co effcient for u
+     delta0 ~ dnorm(mean = 6,sd  = 1)
+     delta1 ~ dnorm(mean = 6,sd  = 1)
+          
+  # additional Parameters for Tail Part
+            xi ~ T(dnorm(0.4, sd = 0.1),-0.5,Inf)
+          sigma ~ dgamma(shape = 2.5,scale = 2)
+  #  Distribution for data
+    for(i in 1:n)
+    {
+       # mixture model Regression
+      for(j in 1:m)
+      { 
+        mu[i,j] ~ dnorm(theta0[j]+theta1[j]*X[i], sd = 0.3)
+      }
+  #  GPD Regression
+           u[i] ~ dnorm(delta0 + delta1*X[i],sd = 1)
+           y[i] ~ dTotal(weights[1:m],mu[i,1:m],eta[1:m],u[i],sigma,xi)
+    }
+ })
+```
+```{r MCMC simulation, include=FALSE}
+Sim <- function(data,code,epsilon,n_mix,true,p_qte,ISE,mcmc.plot = FALSE,n_iter,n_burnin,n_chains,n_thin)
+{
+  # Model Constants
+  consts =list(n=length(data$y),m=n_mix)
+  # Parameter initialization,
+  inits = list(
+              alpha = 1
+             ,weights = rep(1/consts$m,consts$m)
+             ,eta = runif(consts$m)
+             ,theta0 = rep(6.5,consts$m),theta1 = rep(2,consts$m)
+             ,mu = matrix(rexp(consts$m*consts$n,0.2),nrow = consts$n)
+             ,u=rep(quantile(data$y,0.90,na.rm =TRUE),consts$n)
+             ,sigma=2,xi=0.2
+             ,delta0 = 7,delta1=9
+             ,v  = rbeta(consts$m, 1, 1))
+  # running mcmc
+  nimble_out <- nimbleMCMC(code, constants = consts, data = data
+                          ,monitors = c("alpha","weights","eta","theta1","theta0","delta0","delta1","sigma","xi")
+                          ,inits = inits,niter = n_iter,nburnin = n_burnin
+                          ,nchains=n_chains,thin = n_thin,progressBar = FALSE
+                          ,samplesAsCodaMCMC = TRUE,summary = TRUE)
+
+  if(n_chains==1)
+    estimates = round(nimble_out$summary[,1],3) 
+  else
+    estimates = round(nimble_out$summary$all.chains[,1],3) 
+  #Storing Result
+  my.list = list()
+# estimated parameters for Mixture
+my.list$alpha = estimates["alpha"]  
+E = NULL
+W = NULL
+T1 = NULL
+T0 =NULL
+for(i in 1:consts$m)
+{
+  W <- paste0(W,"weights[",i,"]",sep =" ")
+  E <- paste0(E,"eta[",i,"]",sep =" ")
+  T1 <- paste0(T1,"theta1[",i,"]",sep =" ")
+  T0 <- paste0(T0,"theta0[",i,"]",sep =" ")
+}
+
+# estimated coefficient for clusters
+theta1_hat = estimates[unlist(strsplit(T1," "))]
+theta0_hat = estimates[unlist(strsplit(T0," "))]
+# Calculating estimated cluster mean
+MU = theta0_hat + theta1_hat%*%t(data$X)
+# estimated cluster parameters
+mix_par = arrange(data.frame(weights = estimates[unlist(strsplit(W," "))], mu = rowMeans(MU) , 
+                             eta = estimates[unlist(strsplit(E," "))] ,row.names = NULL),desc(weights))
+id = min(which(cum_sum(mix_par$weights)>1-epsilon),which(mix_par$weights<epsilon))
+mix_par[id,]$weights = 1- sum(mix_par[1:id-1,]$weights)
+mix_par = mix_par[1:id,]
+weights_hat = mix_par$weights
+mu_hat = mix_par$mu
+eta_hat = mix_par$eta
+my.list$Mixture_parameters = mix_par
+# estimated parameters for Tail
+delta0_hat = estimates["delta0"]
+delta1_hat = estimates["delta1"]
+u_hat = mean(delta0_hat+data$X*delta1_hat)
+sigma_hat = estimates["sigma"]
+xi_hat = estimates["xi"]
+my.list$GPD_parameters = data.frame( u = u_hat, sigma = sigma_hat , xi = xi_hat,row.names = NULL )
+# MCMC plot
+if(mcmc.plot == TRUE)
+  {S = ggs(nimble_out$samples[,c('alpha','sigma','xi',"delta0","delta1")])
+  my.list$trace_plot = ggs_traceplot(S,greek = TRUE)
+  my.list$density_plot = ggs_density(S,greek = TRUE)}
+if(ISE == TRUE)
+  {#calculating Integrated Standard error
+samples = nimble_out$samples
+weights = samples[,unlist(strsplit(W," "))]
+mu = t(sapply(seq(1,dim(samples)[1]),function(j){rowMeans(sapply(data$X,function(x){samples[j,unlist(strsplit(T0," "))] + samples[j,unlist(strsplit(T1," "))]*x}))}))
+eta = samples[,unlist(strsplit(E," "))]
+u = rowMeans(sapply(data$X,function(x){samples[,"delta0"] + samples[,"delta1"]*x}))
+sigma = samples[,"sigma"]
+xi = samples[,"xi"]
+ grid  = seq(min(data$y),max(data$y),length.out = 100)
+ ISE = sapply(seq(1,dim(samples)[1]),function(j){mean(sapply(grid,function(x,j){(dTotal(x,weights[j,],mu[j,],eta[j,],u[j],sigma[j],xi[j])-dTrue(x,true$weights,true$mu,true$eta,true$u,true$sigma,true$xi))**2},j))})
+  my.list$Integrated_Squared_error = mean(ISE)
+  # density comparison
+  grid = seq(min(data$y),max(data$y), length.out = length(data$y))
+  f_hat<- sapply(grid,dTotal,weights_hat,mu_hat,eta_hat,u_hat,sigma_hat,xi_hat)
+  f_true <- sapply(grid,dTrue,true$weights,true$mu,true$eta,true$u,true$sigma,true$xi)
+  output = data.frame(grid,f_true,f_hat)
+  names(output) = c("grid","True","Fitted")
+  my.list$density_plot = ggplot(output,aes(x=grid))+
+    geom_line(aes(y=True,color="True"))+
+    geom_line(aes(y=Fitted,color="Fitted"))+
+    xlab('Grid')+ylab('Density')+theme_minimal()+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())}
+  # calculating quantile effects
+  set =  sapply(rep(1,10000),rTotal,weights_hat,mu_hat,eta_hat,u_hat,sigma_hat,xi_hat)
+  my.list$estimated_quantile = quantile(set,p_qte,na.rm=TRUE)
+  return(my.list)
+}
+assign("Sim",Sim,.GlobalEnv)
+```
+
+```{r}
+Analyze=function(out,n_mix=5,true,p=0.95,mcmc.plot = FALSE,post_density = FALSE,n_iter=1000,n_burnin=0,n_chains=1,n_thin=1)
+{
+  # estimated parameter value
+  n_rep=length(out)
+  a_m=array()
+  w_m = array(0,n_mix)
+  e_m=array(0,n_mix)
+  dim = array()
+  m_m=array(0,n_mix)
+  u_m=array()
+  x_m=array()
+  s_m=array()
+  e_q = data.frame(matrix(ncol=length(p),nrow=n_rep))
+  ise=0
+  used = 0
+  diagnostics=list()
+  for(i in 1:n_rep)
+  {
+    if(max(out[[i]]$Mixture_parameters$weights)>0.99)
+    {
+      i = i+1
+      used = used+0
+    }
+    else
+    {
+      a_m[i] = out[[i]]$alpha
+    w_m = w_m + out[[i]]$Mixture_parameters$weights
+    e_m = e_m + out[[i]]$Mixture_parameters$eta
+    m_m = m_m + out[[i]]$Mixture_parameters$mu
+    dim[i] = length(out[[i]]$Mixture_parameters$weights)
+    u_m[i] =  out[[i]]$GPD_parameters$u
+    s_m[i] = out[[i]]$GPD_parameters$sigma
+    x_m[i] = out[[i]]$GPD_parameters$xi
+    e_q[i,] = out[[i]]$estimated_quantile
+    ise = ise + out[[i]]$Integrated_Squared_error
+    if(mcmc.plot == TRUE)
+    {
+      diagnostics$trace_plots[[i]] = out[[i]]$trace_plot
+      diagnostics$density_plots[[i]] = out[[i]]$density_plot
+    }
+     used = used+1
+    }
+  }
+  a_m=na.omit(a_m)
+  w_m = na.omit(w_m)
+  e_m=na.omit(e_m)
+  dim = na.omit(dim)
+  m_m=na.omit(m_m)
+  u_m=na.omit(u_m)
+  x_m=na.omit(x_m)
+  s_m=na.omit(s_m)
+  e_q = na.omit(e_q)
+  # parameter Estimates
+  alpha_hat = mean(a_m)
+  weights_hat = w_m[1:min(dim,na.rm =TRUE)]/used
+  weights_hat[min(dim,na.rm =TRUE)] = 1 - sum(w_m[1:min(dim,na.rm =TRUE)-1]/used)
+  eta_hat = e_m[1:min(dim,na.rm =TRUE)]/used
+  mu_hat = m_m[1:min(dim,na.rm =TRUE)]/used
+  u_hat = mean(u_m)
+  sigma_hat = mean(s_m)
+  xi_hat = mean(x_m)
+    # Calculating Bias
+  bias_u = u_hat-mean(true$u)
+  bias_sigma = sigma_hat-true$sigma
+  bias_xi = xi_hat-true$xi
+  # calculating empirical SE
+  empirical_SE_alpha = sd(a_m)
+  empirical_SE_u = sd(u_m)
+  empirical_SE_sigma = sd(s_m)
+  empirical_SE_xi = sd(x_m)
+  
+  # number of effective sample
+  n_total = (n_iter-n_burnin)*(n_chains/n_thin)
+  # calculating Monte-Carlo standard error
+  MC_SE_alpha = empirical_SE_alpha/sqrt(n_total)
+  MC_SE_u = empirical_SE_u/sqrt(n_total)
+  MC_SE_sigma = empirical_SE_sigma/sqrt(n_total)
+  MC_SE_xi = empirical_SE_xi/sqrt(n_total)
+
+  #storing result
+  final = list()
+  final$used_iteration = used
+  final$MISE = ise/used
+  final$total.samples.used = n_total
+  final$summary.mcmc = matrix(c(u_hat,sigma_hat,xi_hat,bias_u,bias_sigma,bias_xi
+                                ,empirical_SE_u,empirical_SE_sigma
+                                ,empirical_SE_xi,MC_SE_u,MC_SE_sigma,MC_SE_xi),nrow=3)
+  colnames(final$summary.mcmc) = c("Estimates","Bias","Empirical_SE","MC_SE")
+  rownames(final$summary.mcmc) = c("u","sigma","xi")
+  final$mcmc.diagnostics = diagnostics
+   final$posterior_estimate = list(alpha_hat,weights_hat,mu_hat,eta_hat,u_hat,sigma_hat,xi_hat)
+   names(final$posterior_estimate ) = c("alpha","weights","mu","eta","u","sigma","xi")
+  # density Plot of parameters
+   if(post_density ==TRUE)
+  {
+     samples = data.frame('alpha'=a_m,'u'=u_m,'sigma'= s_m,'Xi'=x_m)
+  posterior = list()
+  posterior$alpha = ggplot(samples,aes(x=alpha),..density..)+
+                    geom_histogram(aes(y=..density..),color="blue",fill="lightgreen")+
+                      geom_density(color="red",size=1)+xlab(expression(alpha))+ylab('Density')+
+                                                                                    theme_classic()
+                      
+  posterior$u = ggplot(samples,aes(x=u))+
+                   geom_histogram(aes(y=..density..),color="blue",fill="lightgreen")+
+                      geom_density(color="red",size=1)+xlab(expression(u))+
+                                                                                    theme_classic()
+  posterior$sigma = ggplot(samples,aes(x=sigma),..density..)+
+                      geom_histogram(aes(y=..density..),color="blue",fill="lightgreen")+
+                      geom_density(color="red",size=1)+xlab(expression(sigma))+ylab('Density')+
+                                                                                    theme_classic()
+                      
+  posterior$xi =  ggplot(samples,aes(x=Xi),..density..)+
+                 geom_histogram(aes(y=..density..),color="blue",fill="lightgreen")+
+                      geom_density(color="red",size=1)+xlab(expression(xi))+ylab('Density')+
+                                                                                    theme_classic()
+  final$Posterior_densities = posterior
+   }
+   colnames(e_q) = NULL
+  final$quantiles = e_q
+ # density comparison
+  r_true = rTrue(n_total,true$weights,true$mu,true$eta,true$u,true$sigma,true$xi)
+  grid = seq(min(r_true),max(r_true+5), length.out = n_total)
+  f_hat <- sapply(grid,dTotal,weights_hat,mu_hat,eta_hat,u_hat,sigma_hat,xi_hat)
+  f_true = sapply(grid, dTrue,true$weights,true$mu,true$eta,true$u,true$sigma,true$xi)
+ 
+ final$Density_Plots = ggplot()+xlab('')+theme_classic()+xlim(min(r_true),max(true$u,u_hat)+5)+
+    geom_histogram(aes(r_true,..density..),color="black",fill="beige",bins = 30)+
+    geom_line(aes(x=grid,y=f_true ,color="TRUE"),linewidth=0.7)+
+    geom_line(aes(x=grid,y=f_hat,color = "Fitted"),linewidth=0.75,linetype = 'dashed')+
+    geom_vline(aes(xintercept = true$u ,color='TRUE'),linewidth=0.7)+
+    geom_vline(aes(xintercept = u_hat ,color='Fitted'),linetype="dashed",linewidth=0.75)+
+    ylab('Density') 
+  
+  # # plot zoom
+   final$zoomed_Density_Plots = ggplot()+xlab('')+theme_classic()+xlim(true$u-2,true$u+2)+
+    geom_histogram(aes(r_true,..density..),color="black",fill="beige",bins = 30)+
+    geom_line(aes(x=grid,y=f_true ,color="TRUE"),linewidth=0.7)+
+    geom_line(aes(x=grid,y=f_hat,color = "Fitted"),linewidth=0.75,linetype = 'dashed')+
+    geom_vline(aes(xintercept = true$u,color='TRUE'),linewidth=0.7)+
+    geom_vline(aes(xintercept = u_hat ,color='Fitted'),linetype="dashed",linewidth=0.75)+
+    ylab('Density')
+
+  return(final)
+}
+assign('Analyze',Analyze,.GlobalEnv)
+  # output = Analyze(out)
+```
+```{r Simulation Inputs ,comment=NA}
+# Data setup
+## number of data points
+N = 500
+## number of replication
+n_rep = 250
+# propensity score model coefficients
+beta= c(-0.03,-0.4,0.12,0.55)
+# mixture model parameters
+## treatment
+wt1=0.65
+theta0=c(8.5,7)
+theta1=c(2,1)
+eta1_true = c(0.4,0.4)
+
+## control
+wt0=0.55
+gamma0=c(5.5,7)
+gamma1 = c(1.5,2.5)
+eta0_true = c(0.3,0.3)
+
+# GPD parameters
+delta0=c(7.25,7)
+delta1 = c(7,9.5)
+sigma_true = c(3,4)
+xi_true = c(0.4,0.3)
+
+# aditional parameters
+p_QTE = c(0.01,0.05,0.5,0.95,0.99) # pth quantile treatment effect
+n_mix = 5  # number of proposed mixture components
+epsilon = 0.05 # cutoff point trimming weights
+ISE = FALSE
+
+# MCMC parameters
+mcmc.plot = FALSE
+post_density = FALSE
+n_iter=15000
+n_burnin=5000
+n_chains=1
+n_thin=2
+n_cores = detectCores()-2
+seed  = 10
+```
+
+```{r}
+Report = function(n_rep,N,n_mix,beta,wt1,theta0,theta1,eta1_true,wt0,gamma0,gamma1,eta0_true ,delta0,delta1,sigma_true,xi_true,p_QTE,ISE,epsilon,mcmc.plot = FALSE,post_density = FALSE,n_iter,n_burnin,n_chains,n_thin,n_cores,seed)
+{
+   my.list = list()
+  t1=Sys.time()
+  set.seed(seed)
+DATA = data_sim(r=n_rep,N=N,beta = beta,wt1=wt1,theta0=theta0,theta1=theta1,eta1 = eta1_true,wt0=wt0,gamma0=gamma0,gamma1 =gamma1,eta0 = eta0_true ,delta0=delta0,delta1 = delta1, sigma = sigma_true,xi= xi_true)
+mu_true=DATA$mu
+u_true = DATA$u
+treatment_data = vector(mode = "list", length = n_rep)
+control_data = vector(mode = "list", length = n_rep)
+my.list$data.description= list(DATA$Densities_wgpd ,DATA$Densities_wogpd, DATA$observed_densities)
+for (i in 1:n_rep)
+{
+  psmodel=glm(DATA$T[,i]~DATA$X-1,family = 'binomial')
+  Data = data.frame(y = DATA$Y[,i],T = DATA$T[,i],PS = as.numeric(predict.glm(psmodel,type = 'response')))
+  treatment_data[[i]][["y"]]= subset(Data,T==1)$y
+  treatment_data[[i]][["X"]] = subset(Data,T==1)$PS
+  control_data[[i]][["y"]]= subset(Data,T==0)$y
+  control_data[[i]][["X"]]= subset(Data,T==0)$PS
+}
+  true_trt<- list(weights = c(wt1,1-wt1),mu =mu_true[2,] ,eta=eta1_true ,u=u_true[2],sigma = sigma_true[2],xi=xi_true[2])
+  true_con<- list(weights = c(wt0,1-wt0),mu =mu_true[1,] ,eta=eta0_true ,u=u_true[1],sigma = sigma_true[1],xi=xi_true[1])
+  
+# setting up parallel computing
+  my.cluster <- makeCluster(n_cores)
+  registerDoParallel(my.cluster)
+  clusterEvalQ(my.cluster, 
+               {library(nimble)
+                 library(codetools)
+                 library(devtools)
+                 library(Rcpp)
+                 library(dplyr)
+                 library(ggplot2)
+                 library(doSNOW)
+                 library(ggmcmc)
+               })
+  clusterExport(my.cluster,c("dgpd","rgpd","dTrue","rTrue","cum_sum","dTotal","rTotal","code_con","code_trt","Sim"
+  ),envir = .GlobalEnv)
+  
+  
+  out_treat <- parLapply(my.cluster,treatment_data,Sim,code_trt,epsilon,n_mix,true_trt,p_QTE,ISE,mcmc.plot,n_iter,n_burnin,n_chains,n_thin)
+  out_con <- parLapply(my.cluster,control_data,Sim,code_con,epsilon,n_mix,true_con,p_QTE,ISE,mcmc.plot,n_iter,n_burnin,n_chains,n_thin)
+   stopCluster(my.cluster)
+  
+  trt_output = Analyze(out_treat,n_mix,true_trt,p_QTE,mcmc.plot,post_density,n_iter,n_burnin,n_chains,n_thin)
+  con_output = Analyze(out_con,n_mix,true_con,p_QTE,mcmc.plot,post_density,n_iter,n_burnin,n_chains,n_thin)
+  
+  # Calculating  quantile treatment effect
+  q_t_e = trt_output$quantiles
+  q_c_e = con_output$quantiles
+  d = list()
+  Q =list()
+  set1 = sapply(rep(1,10000),rTrue,true_trt$weights,true_trt$mu,true_trt$eta,true_trt$u,true_trt$sigma,true_trt$xi)
+  set0 = sapply(rep(1,10000),rTrue,true_con$weights,true_con$mu,true_con$eta,true_con$u,true_con$sigma,true_con$xi)
+  for(j in 1:ncol(q_t_e))
+  {
+  q_t_t = quantile(set1,p_QTE[j],na.rm=TRUE)
+  q_c_t = quantile(set0,p_QTE[j],na.rm=TRUE)
+  d[[j]]=matrix(c(q_t_t,q_c_t,q_t_t-q_c_t,mean(q_t_e[,j]),mean(q_c_e[,j]),mean(q_t_e[,j])-mean(q_c_e[,j] ),q_t_t-mean(q_t_e[,j]),q_c_t-mean(q_c_e[,j]),(q_t_t-q_c_t)-(mean(q_t_e[,j])-mean(q_c_e[,j])),sd(q_t_e[,j]),sd(q_c_e[,j]),sd(q_t_e[,j]-q_c_e[,j])),nrow=3)
+  colnames(d[[j]]) = c("True","Estimated","Bias","std_error")
+  rownames(d[[j]]) = c("Treated","Control","Treatment Effect")
+  # Quantile distribution plot
+  g = data.frame(quantiles=c(q_t_e[,j],q_c_e[,j]), grp=c(rep("Treated",length(q_t_e[,j])),rep("Control",length(q_c_e[,j])))) 
+  Q[[j]] = ggplot(g)+geom_density(aes(x=quantiles,color = grp))+geom_vline(aes(xintercept= q_t_t,color = "Treated"))+
+    geom_vline(aes(xintercept = q_c_t,color = "Control"))+theme_classic()+xlab("Values")+ labs(title = sprintf(" Distribution of %.2fth Quantile  ", p_QTE[j]))
+  }
+  t=Sys.time()-t1
+  my.list$Total_execution_time = t
+  my.list$quantile_effect = d
+  my.list$quantile_distribution = Q
+  # Treatment Group
+  Treatment = list()
+  Treatment$Mean_Int_Sq_error = trt_output$MISE
+  Treatment$model_Summary = trt_output$summary.mcmc
+  Treatment$estimated = trt_output$posterior_estimate
+  Treatment$used_iteration = trt_output$used_iteration
+  Treatment$True = true_trt
+  Treatment$mcmc.diagnostics = trt_output$mcmc.diagnostics
+  Treatment$Posterior_density = trt_output$Posterior_densities
+   ## density comparison
+  Treatment$True_vs_Fitted = trt_output$Density_Plots
+  Treatment$True_vs_Fitted_Zoomed = trt_output$zoomed_Density_Plots
+  my.list$Treatment = Treatment
+  
+  # Control Group
+  Control = list()
+  Control$Mean_Int_Sq_error = con_output$MISE
+  Control$model_Summary = con_output$summary.mcmc
+  Control$estimated = con_output$posterior_estimate
+  Control$used_iteration = con_output$used_iteration
+  Control$True = true_con
+  Control$mcmc.diagnostics = con_output$mcmc.diagnostics
+  Control$Posterior_density = con_output$Posterior_densities
+   ## density comparison
+  Control$True_vs_Fitted = con_output$Density_Plots
+  Control$True_vs_Fitted_Zoomed = con_output$zoomed_Density_Plots
+  my.list$Control= Control
+  return(my.list)
+}
+```
+
+```{r Final result, warning=FALSE, include=FALSE,comment=NA}
+Final = Report(n_rep,N,n_mix,beta,wt1,theta0,theta1,eta1_true,wt0,gamma0,gamma1,eta0_true ,delta0,delta1,sigma_true,xi_true,p_QTE,ISE,epsilon,mcmc.plot = FALSE,post_density = FALSE,n_iter,n_burnin,n_chains,n_thin,n_cores,seed)
+```
+
+```{r Data Description, eval=FALSE, include=FALSE}
+
+Final$data.description[[1]]
+Final$data.description[[2]]
+Final$data.description[[3]]
+```
+
+```{r Treatment Group, echo=TRUE, warning=FALSE, comment=NA}
+Final$Treatment$Mean_Int_Sq_error
+Final$Treatment$estimated
+Final$Treatment$True
+Final$Treatment$used_iteration
+Final$Treatment$True_vs_Fitted 
+Final$Treatment$True_vs_Fitted_Zoomed
+```
+
+
+
+```{r Control Group, echo=TRUE, warning=FALSE, comment=NA}
+Final$Control$Mean_Int_Sq_error
+Final$Control$estimated
+Final$Control$True
+Final$Control$used_iteration
+Final$Control$True_vs_Fitted 
+Final$Control$True_vs_Fitted_Zoomed 
+```
+
+```{r Quantile Effect, echo=FALSE, warning=FALSE, comment=NA}
+Final$quantile_effect
+Final$quantile_distribution
+Final$Total_execution_time
+```
+
+
+
+

@@ -1,0 +1,385 @@
+---
+title: "with CRP"
+author: "Arnab Aich"
+date: "`r Sys.Date()`"
+output:pdf_document
+editor_options: 
+chunk_output_type: console
+---
+```{r setup, include=FALSE}
+packages = c("nimble","codetools","devtools","Rcpp","dplyr",
+             "ggplot2","parallel","doParallel","doSNOW","ggmcmc","reshape2","job","mvtnorm")
+invisible(xfun::pkg_attach(packages))
+```
+
+```{r}
+deregisterDistributions("dgpd")
+```
+#  Generalized Pareto Distribution density function
+```{r}
+dgpd <- nimbleFunction(
+  run = function(x = double(0),u = double(0),
+                 sigma = double(0),xi = double(0),
+                 log = integer(0, default = 0))
+  {
+    returnType(double(0))
+    z = (x - u) / sigma
+  if(x < u) logProb = -Inf
+  else
+  {
+    if(xi < 0 & x > u-sigma/xi) logProb = -Inf
+    else logProb = -(1 + (1 / xi)) * log(1 + (xi * z)) -log(sigma) 
+  }
+     if(log) return(logProb)
+    else return(exp(logProb))
+  }
+    
+    
+)
+compileNimble(dgpd)
+assign('dgpd', dgpd, .GlobalEnv)
+```
+# Generalized Pareto Distribution generating Function
+```{r}
+rgpd <- nimbleFunction(
+  run=function(n = integer(0),u=double(0)
+               ,sigma=double(0),xi=double(0))
+  {
+    if(n != 1) print("rgpdonly allows n = 1;")
+    else{
+      if(xi!=0) x=u+((sigma/xi)*((runif(1)^(-xi))-1))
+      else x = u - sigma*log(runif(1))
+    }
+    return(x)
+    returnType(double(0))
+  })
+compileNimble(rgpd)
+assign('rgpd', rgpd, .GlobalEnv)
+```
+
+
+
+# Cumulative sum
+```{r}
+cum_sum=nimbleFunction(run=function(p=double(1))
+{
+  returnType(double(1))
+  for(j in 2:length(p))
+    p[j]=p[j-1]+p[j]
+  return(p)
+})
+compileNimble(cum_sum)
+assign('cum_sum',cum_sum,.GlobalEnv)
+```
+
+```{r}
+deregisterDistributions("dTotal")
+```
+
+
+# Total Density Function
+```{r}
+#Density Function
+dTotal<- nimbleFunction(
+  run = function(x=double(0),eta=double(0),mu=double(0),u=double(0),sigma=double(0)
+                 ,xi=double(0),log = integer(0, default = 0)) 
+  {
+    returnType(double(0))
+    if(x<u)
+     prob = dgamma(x,shape = eta, scale = mu/eta)
+    else
+    {
+      P2 = pgamma(u,shape = eta, scale = mu/eta)
+      prob=(1-P2)*dgpd(x,u,sigma,xi)
+    }
+    if(!log) return(prob)
+    else return(log(prob))
+  })
+compileNimble(dTotal) 
+assign('dTotal', dTotal, .GlobalEnv)
+```
+
+# Total Generating Function 
+```{r}
+#Generating Function 
+rTotal <- nimbleFunction(run=function(n = integer(0)
+                                      ,eta=double(0)
+                                      ,mu=double(0),u=double(0)
+                                      ,sigma=double(0),xi=double(0))
+{
+  returnType(double(0))
+  if(n != 1) print("rTotal only allows n = 1;")
+  else
+    {
+    y=runif(1)
+    P = pgamma(u,shape = eta, scale = mu/eta)
+    x =  rgamma(1,shape = eta, scale = mu/eta)
+    
+    a=(1-y)/(1-P)
+    if(xi!=0) r=u+((sigma/xi)*((a^(-xi))-1))
+      else r = u - sigma*log(a)
+    }
+    if(y<P) return(x)
+    else return(r)
+})   
+compileNimble(rTotal)
+assign('rTotal', rTotal, .GlobalEnv)
+```
+
+
+#  Generate Data(r=#replication,N=#data points,p=tail_index)
+```{r}
+data_sim <- function(r=10,N=200,p=0.8,alpha = 1,beta ,theta ,eta ,sigma,xi)
+{
+  out = list()
+  # Generating Covariates
+  x0 = rep(1,N)
+  x1 = sample(c(-1,1),N, replace = TRUE)
+  x2 = sample(seq(1,10),N, replace = TRUE)
+  x3 = rnorm(N,10,sd=2)
+  x4 = runif(N,5,10)
+  x5 = rgamma(N,4,scale = 0.5)
+  X = data.frame(x0,x1,x2,x3,x4,x5)
+  out$X = X 
+ # using CRP for cluster assignment
+z <- integer(n) # Assignments
+k <- 1 # Number of clusters
+n_k <- integer(k) # Number of samples in each cluster
+
+# Sample from the Chinese Restaurant Process
+for (i in 1:N) {
+  # Calculate probabilities for each cluster
+  probs <- n_k / (i - 1 + alpha) # Cluster probabilities
+  probs <- c(probs, alpha / (i - 1 + alpha)) # New cluster probability
+  
+  # Sample from categorical distribution
+  z[i] <- sample.int(k + 1, size = 1, prob = probs)
+  
+  # Update cluster assignments and counts
+  if (z[i] == k + 1) {
+    k <- k + 1 # Create new cluster
+    n_k[k] <- 1 # Assign sample to new cluster
+  } else {
+    n_k[z[i]] <- n_k[z[i]] + 1 # Add sample to existing cluster
+  }
+}
+    pi = as.numeric(prop.table(table(z)))
+    out$weights = pi
+    W = cum_sum(pi)
+  
+  
+  # establish Relation
+   mu = exp(as.matrix(X)%*%theta[,1:length(pi)])      # using inverse link for gamma regression
+    u = as.matrix(X)%*%beta
+    out$mu = mu
+    out$u = u
+  # Generating Response  
+  out$Y = data.frame(matrix(ncol=r,nrow=N))
+  n_rep=1
+  repeat{
+
+    for(j in 1:N)
+    {
+      y = runif(1)
+      if(y< p)
+    {
+     for(i in 2:length(W))
+    {
+      k=runif(1)
+      if(W[i-1]<k & W[i]>k)  out$Y[j,n_rep] = rgamma(1, shape = eta[i], scale = mu[j,i]/eta[i]) 
+      else  out$Y[j,n_rep] = rgamma(1, shape = eta[1], scale = mu[j,1]/eta[1])
+     }}
+    else
+    {
+      a=(1-y)/(1-p)
+       out$Y[j,n_rep]=u[j]+((sigma/xi)*(a**(-xi)-1))    
+    }}
+    n_rep=n_rep+1
+    if(n_rep>r){break}
+  }
+  names(out$Y) <- NULL  
+  
+  return(out)
+}
+assign('data_sim',data_sim,.GlobalEnv)
+```
+# Generating data
+```{r}
+# beta = rnorm(6,0.5,sd=0.1)
+beta= seq(0.5,2,length = 6);beta
+theta = matrix(seq(0.1,0.07,length = 60),nrow = 6,ncol = 10,byrow = TRUE)
+eta = seq(2.5,8,length = 10) ;eta
+###############################################################################################################
+DATA=data_sim(r=10,N=200,p=0.85,alpha = 2,beta = beta ,theta = theta ,eta = eta , sigma = 2.5,xi= 0.6)
+Y = DATA$Y 
+boxplot(Y)
+round(range(Y),3)
+mean(round(DATA$u,3))
+colMeans(round(DATA$mu,3))
+mean(apply(Y,2,quantile,0.9))
+DATA$weights
+```
+
+# Estimating Prior sd for U
+```{r}
+sigma_prior = function(y,sigma)
+{
+  root = function(sigma)
+  {
+    a = quantile(y,0.9)
+    a1=quantile(y,0.99)
+    a2=quantile(y,0.5)
+    fun <- pnorm(a1,a,sd = sigma) - pnorm(a2,a,sd = sigma)- 0.90
+    return(fun)
+  }
+  uniroot(root,c(0,1000),extendInt="yes")$root
+}
+sigma_u <- mean(sapply(DATA$Y,sigma_prior));sigma_u
+max_y = max(Y)
+```
+# model Code
+```{r}
+code=nimbleCode(
+  {
+    # parameters for Central part and Tail part (DPMG)
+    alpha ~ dgamma(1,scale = 1)
+    psi[1:n] ~ dCRP(size = n,conc = alpha)
+    # weights[1:m] <- prop.table((table(psi[1:n])))
+    
+    # pi[1:m] <- alpha*rep(1/m,m)
+    # weights[1:m] ~ ddirch(pi[1:m])
+    # co effcient for u
+    for(k in 1:p)
+    {
+      beta[k] ~ dnorm(0.5, sd = 0.2)
+    }
+    # shape and mean for Gamma
+    for(j in 1:m)
+    {
+      eta[j] ~ dgamma(1,scale = 3)
+      for( k in 1:p)
+      {
+        theta[j,k] ~ dnorm(0, sd = 0.1)
+      }
+    }
+        # distribution of mixture components
+     for(i in 1:n)
+    {
+      # mixture model Regression
+      for(j in 1:m)
+      { 
+        M[i,j] <- exp(inprod(theta[j,1:p], X[i,1:p]))
+        mu[i,j] ~ dgamma(shape = delta, scale = M[i,j]/delta)
+      }
+        
+    }
+    
+   # # additional Parameters for Tail Part
+         xi ~ dnorm(0,sd=1)
+      sigma ~ dgamma(shape =2,scale = 1)
+     # lambda ~ dinvgamma(shape =0.2,scale = 2)
+     delta ~ dinvgamma(shape =0.2,scale = 2)
+  #  Distribution for data
+    for(i in 1:n)
+    {
+      # GPD Regression
+      u[i] ~ dnorm(inprod(beta[1:p], X[i,1:p]),sd = lambda )
+      y[i] ~ dTotal(eta[psi[i]],mu[i,psi[i]],u[i],sigma,xi)
+    }
+ })
+```
+
+
+```{r include=FALSE}
+y=DATA$Y[,2]
+x=DATA$X
+n_mix=20
+data = list(y=y,X=x)
+n_chains = 1
+  ##Setting Up model
+  # Model Constants
+  consts=list(n=length(data$y),m=n_mix, p = ncol(data$X))
+  # Parameter initialization,
+  inits=list(eta=rexp(consts$m, 1),
+             mu = matrix(rexp(consts$m*consts$n, 1),nrow = consts$n)
+             ,beta = rep(0, consts$p)
+             # ,gamma = rep(0, consts$k) 
+             ,psi = sample.int(consts$m,consts$n,replace = TRUE)
+             ,theta = matrix(1,nrow = consts$m,ncol = consts$p)
+               ,lambda = 1
+             ,delta = 2
+             ,alpha =1,sigma=3
+             ,u=rep(quantile(data$y,0.9),consts$n)
+             ,xi=0.2
+              # rep(0.5,consts$n)
+             )
+  Rmodel <- nimbleModel(code, data = data, inits = inits, constants = consts)
+  Cmodel <- compileNimble(Rmodel)
+  mcmcConf <- configureMCMC(Cmodel)
+ 
+  
+  Rmcmc <- buildMCMC(mcmcConf)
+  Cmcmc <- compileNimble(Rmcmc)
+  # nimble_out <- runMCMC(Cmcmc,niter = 5000, nchains = n_chains,nburnin = 500,
+  #                       inits = inits, setSeed = TRUE,thin=3,
+  #                       samples = FALSE, summary = TRUE)
+```
+
+
+```{r include=FALSE}
+
+nimble_out <- nimbleMCMC(code, constants = consts, data = data,
+                              monitors = c("alpha","eta","theta","beta" ,"sigma","xi"),thin = 3,
+                           inits = inits,niter = 100, nchains = 1 , nburnin =                                 40,samplesAsCodaMCMC = TRUE,summary = TRUE)
+
+
+  
+estimates = round(nimble_out$summary[,1],3)
+```
+
+
+```{r}
+B = NULL
+G = NULL
+for(i in 1:consts$p)
+{
+  B <- paste0(B,"beta[",i,"]",sep =" ")
+  # G <- paste0(G,"gamma[",i,"]",sep =" ")
+}
+
+T = NULL
+for(i in 1:consts$m)
+{
+  for(j in 1:consts$p)
+    T <- paste0(T,"theta[",i,",",sep =" ", j,"]",sep ="  ")
+}
+
+W = NULL
+E = NULL
+for(i in 1:consts$m)
+{
+  W <- paste0(W,"weights[",i,"]",sep =" ")
+  E <- paste0(E,"eta[",i,"]",sep =" ")
+}
+M = NULL
+for(i in 1:consts$n)
+{
+  for(j in 1:consts$p)
+    M <- paste0(M,"mu[",i,",",sep =" ", j,"]",sep ="  ")
+}
+theta = matrix(estimates[unlist(strsplit(T,"  "))],nrow = consts$p,byrow = TRUE)
+mu = exp(as.matrix(data$X)%*%theta)
+rowMeans(matrix(mu,nrow = consts$m,byrow = TRUE))
+beta  = estimates[unlist(strsplit(B," "))];beta
+eta = estimates[unlist(strsplit(E," "))];mean(eta)
+# gamma = estimates[unlist(strsplit(G," "))]
+# weight = estimates[unlist(strsplit(W," "))];weight
+u = (as.matrix(DATA$X)%*%as.numeric(beta));mean(u)
+estimates['xi']
+estimates['alpha']
+estimates['sigma']
+```
+
+
+
+
