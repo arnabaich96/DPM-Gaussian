@@ -1,5 +1,5 @@
 ---
-title: "Mixture Model Quantile treatment effect"
+title: "Mixture Model Quantile treatment effect with Generalized Pareto Distribution"
 author: "Arnab Aich"
 date: "`r Sys.Date()`"
 output: 
