@@ -1,5 +1,5 @@
-t1 = Sys.time()
 library(rmarkdown)
+t1 = Sys.time()
 render("Norm_only.Rmd")
 gc()
 render("Norm_Gpd.Rmd")
