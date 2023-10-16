@@ -1,5 +1,5 @@
 ---
-title: "Normal GPD Quantile treatment effect"
+title: "Normal with Generalized Pareto Distribution Quantile treatment effect"
 author: "Arnab Aich"
 date: "`r Sys.Date()`"
 output: 
