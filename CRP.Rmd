@@ -8,7 +8,7 @@ chunk_output_type: console
 ---
 ```{r setup, include=FALSE}
 packages = c("nimble","codetools","devtools","Rcpp","dplyr",
-             "ggplot2","parallel","doParallel","doSNOW","ggmcmc","reshape2","job","mvtnorm")
+             "ggplot2","parallel","doParallel","doSNOW","ggmcmc","reshape2","mvtnorm")
 invisible(xfun::pkg_attach(packages))
 ```
 
@@ -142,7 +142,7 @@ data_sim <- function(r=10,N=200,p=0.8,alpha = 1,beta ,theta ,eta ,sigma,xi)
   X = data.frame(x0,x1,x2,x3,x4,x5)
   out$X = X 
  # using CRP for cluster assignment
-z <- integer(n) # Assignments
+z <- integer(N) # Assignments
 k <- 1 # Number of clusters
 n_k <- integer(k) # Number of samples in each cluster
 
@@ -255,7 +255,7 @@ code=nimbleCode(
     }
     # shape and mean for Gamma
     for(j in 1:m)
-    {
+    {0
       eta[j] ~ dgamma(1,scale = 3)
       for( k in 1:p)
       {
@@ -274,11 +274,10 @@ code=nimbleCode(
         
     }
     
-   # # additional Parameters for Tail Part
+   # additional Parameters for Tail Part
          xi ~ dnorm(0,sd=1)
       sigma ~ dgamma(shape =2,scale = 1)
-     # lambda ~ dinvgamma(shape =0.2,scale = 2)
-     delta ~ dinvgamma(shape =0.2,scale = 2)
+      delta ~ dinvgamma(shape =0.2,scale = 2)
   #  Distribution for data
     for(i in 1:n)
     {
@@ -320,9 +319,9 @@ n_chains = 1
   
   Rmcmc <- buildMCMC(mcmcConf)
   Cmcmc <- compileNimble(Rmcmc)
-  # nimble_out <- runMCMC(Cmcmc,niter = 5000, nchains = n_chains,nburnin = 500,
-  #                       inits = inits, setSeed = TRUE,thin=3,
-  #                       samples = FALSE, summary = TRUE)
+  nimble_out <- runMCMC(Cmcmc,niter = 5000, nchains = n_chains,nburnin = 500,
+                        inits = inits, setSeed = TRUE,thin=3,
+                        samples = FALSE, summary = TRUE)
 ```
 
 
@@ -330,7 +329,7 @@ n_chains = 1
 
 nimble_out <- nimbleMCMC(code, constants = consts, data = data,
                               monitors = c("alpha","eta","theta","beta" ,"sigma","xi"),thin = 3,
-                           inits = inits,niter = 100, nchains = 1 , nburnin =                                 40,samplesAsCodaMCMC = TRUE,summary = TRUE)
+                           inits = inits,niter = 10000, nchains = 1 , nburnin =  4000,samplesAsCodaMCMC = TRUE,summary = TRUE)
 
 
   
